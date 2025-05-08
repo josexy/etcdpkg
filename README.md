@@ -13,44 +13,43 @@ go get github.com/josexy/etcdpkg
 - Discovery
 
 ```go
-import etcd "github.com/josexy/etcdpkg"
+package main
+
+import (
+	"context"
+	"log"
+	"math/rand/v2"
+	"strconv"
+
+	etcdpkg "github.com/josexy/etcdpkg"
+	"github.com/josexy/etcdpkg/registry"
+	"github.com/josexy/etcdpkg/service"
+)
 
 func main() {
-	r, err := etcd.NewTypedRegister([]string{"127.0.0.1:2379"}, 10, etcd.MarshalerFunc[string](func(v string) ([]byte, error) {
-		return []byte(v), nil
-	}))
+	informer, err := etcdpkg.NewInformer([]string{"127.0.0.1:22379"},
+		etcdpkg.InformerOption[*service.ServiceInstance]{
+			Encoder: service.DefaultJSONEncoder(),
+			Decoder: service.DefaultJSONDecoder(),
+		}, etcdpkg.WithLeaseTTL(5))
 	if err != nil {
-		log.Fatalln(err)
+		panic(err)
 	}
-	r.Register(context.Background(), "/prefix/svc1", "localhost")
-	r.Close()
-}
-```
-
-```go
-func main() {
-	d, err := etcd.NewTypedDiscovery([]string{"127.0.0.1:2379"}, etcd.UnmarshalerFunc[string](func(d []byte) (string, error) {
-		return string(d), nil
-	}))
-	if err != nil {
-		log.Fatalln(err)
-	}
-	lw, err := d.ListWatch(context.Background(), "/prefix")
-	if err != nil {
-		log.Fatalln(err)
-	}
-	lw.Watcher().AddEventHandler(etcd.EventHandlerFunc[string]{
-		AddFunc: func(kv *etcd.TypedKeyObject[string]) {
-			log.Printf("Add %s:%s\n", kv.Key, kv.Object)
-		},
-		UpdateFunc: func(oldkv, newKv *etcd.TypedKeyObject[string]) {
-			log.Printf("Update %s:%s --> %s:%s\n", oldkv.Key, oldkv.Object, newKv.Key, newKv.Object)
-		},
-		DeleteFunc: func(kv *etcd.TypedKeyObject[string]) {
-			log.Printf("Delete %s:%s\n", kv.Key, kv.Object)
-		},
+	defer informer.Close()
+	registry := registry.NewRegistrar(informer)
+	registry.Register(context.Background(), &service.ServiceInstance{
+		ID:        strconv.FormatInt(rand.Int64(), 10),
+		Name:      "test-svc",
+		Version:   "v1.0.0",
+		Metadata:  map[string]string{},
+		Endpoints: []string{"tcp://127.0.0.1:8080"},
 	})
-	time.Sleep(time.Hour)
-	d.Close()
+	watcher, _ := registry.Watch(context.Background(), "test-svc")
+	defer watcher.Stop()
+	svcInstances, _ := watcher.Next()
+	for _, svcInstance := range svcInstances {
+		log.Println("watch service", svcInstance)
+	}
 }
+
 ```
