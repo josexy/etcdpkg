@@ -7,14 +7,16 @@ import (
 	"testing"
 	"time"
 
-	etcd "github.com/josexy/etcdpkg"
+	etcdpkg "github.com/josexy/etcdpkg"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var endpoints = []string{
 	"127.0.0.1:22379",
 }
 
-func printKvs(t *testing.T, kvs []*etcd.KeyValue) {
+func printKvs(t *testing.T, kvs []*etcdpkg.KeyValue) {
 	t.Log()
 	for _, kv := range kvs {
 		t.Log("->", kv.KeyString(), kv.ValueString(), kv.CreateRevision, kv.ModRevision, kv.Version, kv.Lease)
@@ -22,10 +24,8 @@ func printKvs(t *testing.T, kvs []*etcd.KeyValue) {
 }
 
 func TestEtcdClient(t *testing.T) {
-	client, err := etcd.NewClient(endpoints, 3)
-	if err != nil {
-		t.Fatal(err)
-	}
+	client, err := etcdpkg.NewClient(endpoints, etcdpkg.WithLeaseTTL(3))
+	require.NoError(t, err)
 	defer client.Close()
 	ctx := context.Background()
 	for i := 1; i <= 5; i++ {
@@ -41,38 +41,46 @@ func TestEtcdClient(t *testing.T) {
 
 	kvs, _ = client.GetWithSort(ctx, "key", 0, true)
 	printKvs(t, kvs)
+
 	client.DeleteWithPrefix(ctx, "key")
 }
 
-func TestEtcdRegisterAndDiscovery(t *testing.T) {
+func TestEtcdInformer(t *testing.T) {
 	const prefix = "/prefix/"
-	discovery, err := etcd.NewTypedDiscovery(endpoints, etcd.UnmarshalerFunc[string](func(d []byte) (string, error) {
+	marshaler := etcdpkg.EncoderFunc[string](func(v string) ([]byte, error) {
+		return []byte(v), nil
+	})
+	unmarshaler := etcdpkg.DecoderFunc[string](func(d []byte) (string, error) {
 		return string(d), nil
-	}))
-	if err != nil {
-		t.Fatal(err)
-	}
+	})
+
+	informer, err := etcdpkg.NewInformer(endpoints, etcdpkg.InformerOption[string]{
+		Encoder: marshaler,
+		Decoder: unmarshaler,
+	})
+	require.NoError(t, err)
+
 	t.Logf("watch prefix: %v", prefix)
-	lw, err := discovery.ListWatch(context.Background(), prefix)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lw.Watcher().AddEventHandler(etcd.EventHandlerFunc[string]{
-		AddFunc: func(kv *etcd.TypedKeyObject[string]) {
+	lw, err := informer.ListWatch(context.Background(), prefix)
+	require.NoError(t, err)
+
+	lw.Watcher().AddEventHandler(etcdpkg.EventHandlerFunc[string]{
+		AddFunc: func(kv *etcdpkg.KeyObject[string]) {
 			t.Logf("Add %s:%s\n", kv.Key, kv.Object)
 		},
-		UpdateFunc: func(oldkv, newKv *etcd.TypedKeyObject[string]) {
+		UpdateFunc: func(oldkv, newKv *etcdpkg.KeyObject[string]) {
 			t.Logf("Update => %s:%s --> %s:%s\n", oldkv.Key, oldkv.Object, newKv.Key, newKv.Object)
 		},
-		DeleteFunc: func(kv *etcd.TypedKeyObject[string]) {
+		DeleteFunc: func(kv *etcdpkg.KeyObject[string]) {
 			t.Logf("Delete %s:%s\n", kv.Key, kv.Object)
 		},
 	})
 
 	go func() {
-		service, err := etcd.NewTypedRegister(endpoints, 5, etcd.MarshalerFunc[string](func(v string) ([]byte, error) {
-			return []byte(v), nil
-		}))
+		informer, err := etcdpkg.NewInformer(endpoints, etcdpkg.InformerOption[string]{
+			Encoder: marshaler,
+			Decoder: unmarshaler,
+		}, etcdpkg.WithLeaseTTL(5))
 		if err != nil {
 			panic(err)
 		}
@@ -85,86 +93,49 @@ func TestEtcdRegisterAndDiscovery(t *testing.T) {
 
 		t.Log("add key", key1)
 		t.Log("add key", key2)
-		_ = service.Put(context.Background(), key1, hostPort1)
-		_ = service.Put(context.Background(), key2, hostPort2)
+		_ = informer.Put(context.Background(), key1, hostPort1)
+		_ = informer.Put(context.Background(), key2, hostPort2)
 
 		time.Sleep(time.Second)
 		t.Log("update key", key2)
-		_ = service.Put(context.Background(), key2, net.JoinHostPort("127.0.0.1", "2111"))
+		_ = informer.Put(context.Background(), key2, net.JoinHostPort("127.0.0.1", "2111"))
 
 		time.Sleep(time.Second)
 		t.Log("del key", key1)
 		t.Log("del key", key2)
-		service.Delete(context.Background(), key1)
-		service.Delete(context.Background(), key2)
+		informer.Delete(context.Background(), key1)
+		informer.Delete(context.Background(), key2)
 
-		service.Close()
+		informer.Close()
 		t.Log("service register close")
 	}()
 
 	time.Sleep(time.Second * 5)
-	discovery.Close()
+	informer.Close()
 	time.Sleep(time.Millisecond * 100)
 }
 
-func TestDiscoveryStopWatch(t *testing.T) {
-	discovery, err := etcd.NewTypedDiscovery(endpoints, etcd.UnmarshalerFunc[string](func(d []byte) (string, error) {
-		return string(d), nil
-	}))
-	if err != nil {
-		t.Fatal(err)
+func TestEtcdPagination(t *testing.T) {
+	client, err := etcdpkg.NewClient(endpoints, etcdpkg.WithLeaseTTL(10))
+	assert.Nil(t, err)
+	defer client.Close()
+
+	kvs, err := client.GetWithPrefix(context.Background(), "test")
+	assert.Nil(t, err)
+	t.Log("list kvs", len(kvs))
+	for _, kv := range kvs {
+		t.Log(kv.String())
 	}
-
-	lw, err := discovery.ListWatch(context.Background(), "/test")
-	if err != nil {
-		t.Fatal(err)
+	for i := 0; i < 10; i++ {
+		client.Put(context.Background(), "test/key"+strconv.Itoa(i), time.Now().String())
 	}
-	lw.Watcher().AddEventHandler(etcd.EventHandlerFunc[string]{
-		AddFunc: func(kv *etcd.TypedKeyObject[string]) {
-			t.Logf("Add %s:%s\n", kv.Key, kv.Object)
-		},
-		UpdateFunc: func(oldkv, newKv *etcd.TypedKeyObject[string]) {
-			t.Logf("Update => %s:%s --> %s:%s\n", oldkv.Key, oldkv.Object, newKv.Key, newKv.Object)
-		},
-		DeleteFunc: func(kv *etcd.TypedKeyObject[string]) {
-			t.Logf("Delete %s:%s\n", kv.Key, kv.Object)
-		},
-	})
-
-	register, err := etcd.NewTypedRegister(endpoints, 7, etcd.MarshalerFunc[string](func(v string) ([]byte, error) { return []byte(v), nil }))
-	if err != nil {
-		t.Fatal(err)
+	kvs, err = client.GetWithSort(context.Background(), "test", 0, true)
+	assert.Nil(t, err)
+	t.Log("list kvs", len(kvs))
+	for _, kv := range kvs {
+		t.Log(kv.String())
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		ticker := time.NewTicker(time.Millisecond * 500)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				t.Log(ctx.Err())
-				return
-			case <-ticker.C:
-				key := strconv.Itoa(time.Now().Second())
-				register.Put(context.Background(), "/test2/"+key, key)
-			}
-		}
-	}()
-	go func() {
-		time.Sleep(time.Second * 4)
-		t.Log("stop watch")
-		discovery.StopWatch("/test2")
-	}()
-
-	time.Sleep(time.Second * 5)
-	t.Log("close register")
-	cancel()
-	register.Close()
-
-	time.Sleep(time.Second)
-	t.Log("close discover")
-	discovery.Close()
-	time.Sleep(time.Second)
-	t.Log("done")
+	for rr := range client.GetWithRange(context.Background(), "test", 3) {
+		t.Log("-->", len(rr.Kvs), rr.Err)
+	}
 }

@@ -11,52 +11,66 @@ import (
 )
 
 type EtcdClient struct {
-	client        *clientv3.Client
-	leaseID       clientv3.LeaseID
-	cancelFunc    func()
-	keepAliveChan <-chan *clientv3.LeaseKeepAliveResponse
+	opt                *options
+	client             *clientv3.Client
+	cancelFunc         func()
+	leaseID            clientv3.LeaseID
+	leaseKeepAliveChan <-chan *clientv3.LeaseKeepAliveResponse
 }
 
-func NewClient(endpoints []string, leaseTTL int64) (*EtcdClient, error) {
-	c, err := clientv3.New(clientv3.Config{
-		Endpoints:       endpoints,
-		DialTimeout:     5 * time.Second,
-		MaxUnaryRetries: 5,
-		DialOptions: []grpc.DialOption{
-			grpc.WithBlock(),
-		},
-	})
+func NewClient(endpoints []string, opts ...Option) (*EtcdClient, error) {
+	opt := newOption(opts...)
+	config := clientv3.Config{
+		Endpoints:            endpoints,
+		DialTimeout:          opt.dialTimeout,
+		DialKeepAliveTimeout: opt.dialTimeout,
+		MaxUnaryRetries:      5,
+		DialOptions:          []grpc.DialOption{grpc.WithBlock()},
+	}
+	if opt.tlsInfoS != nil {
+		var err error
+		if config.TLS, err = opt.tlsInfoS.ClientConfig(); err != nil {
+			return nil, err
+		}
+	}
+	c, err := clientv3.New(config)
 	if err != nil {
 		return nil, err
 	}
 
-	_, err = c.Status(context.Background(), endpoints[0])
-	if err != nil {
-		return nil, err
+	for _, endpoint := range endpoints {
+		ctx, cancel := context.WithTimeout(context.Background(), opt.contextTimeout)
+		_, err = c.Status(ctx, endpoint)
+		cancel()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	client := &EtcdClient{
 		client: c,
+		opt:    opt,
 	}
-	if leaseTTL > 0 {
+
+	if opt.leaseTTL > 0 {
 		lease := clientv3.NewLease(c)
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), opt.contextTimeout)
 		defer cancel()
 
-		leaseResp, err := lease.Grant(ctx, leaseTTL)
+		leaseRsp, err := lease.Grant(ctx, opt.leaseTTL)
 		if err != nil {
 			return nil, err
 		}
 
 		ctx, cancelFunc := context.WithCancel(context.Background())
-		leaseRespChan, err := lease.KeepAlive(ctx, leaseResp.ID)
+		leaseRespChan, err := lease.KeepAlive(ctx, leaseRsp.ID)
 		if err != nil || leaseRespChan == nil {
 			cancelFunc()
 			return nil, err
 		}
-		client.leaseID = leaseResp.ID
 		client.cancelFunc = cancelFunc
-		client.keepAliveChan = leaseRespChan
+		client.leaseID = leaseRsp.ID
+		client.leaseKeepAliveChan = leaseRespChan
 		go client.keepalive()
 	}
 	return client, nil
@@ -71,7 +85,7 @@ func (c *EtcdClient) keepalive() {
 		select {
 		case <-c.client.Ctx().Done():
 			return
-		case rsp, ok := <-c.keepAliveChan:
+		case rsp, ok := <-c.leaseKeepAliveChan:
 			if !ok || rsp == nil {
 				return
 			}
@@ -80,20 +94,23 @@ func (c *EtcdClient) keepalive() {
 }
 
 func (c *EtcdClient) revoke() (err error) {
+	// cancel/revoke the lease keepalive firstly
 	c.cancelFunc()
 	time.Sleep(time.Millisecond * 50)
-	_, err = c.client.Revoke(context.Background(), c.leaseID)
+	ctx, cancel := context.WithTimeout(context.Background(), c.opt.contextTimeout)
+	defer cancel()
+	_, err = c.client.Revoke(ctx, c.leaseID)
 	return
 }
 
-func (c *EtcdClient) Close() (err error) {
+func (c *EtcdClient) Close() error {
 	if c.leaseID > 0 {
 		c.revoke()
 	}
 	return c.client.Close()
 }
 
-func (c *EtcdClient) get(ctx context.Context, key string, opts ...clientv3.OpOption) (kvs []*KeyValue, err error) {
+func (c *EtcdClient) GetWithOpts(ctx context.Context, key string, opts ...clientv3.OpOption) (kvs []*KeyValue, err error) {
 	resp, err := c.client.Get(ctx, key, opts...)
 	if err != nil {
 		return nil, err
@@ -109,7 +126,7 @@ func (c *EtcdClient) get(ctx context.Context, key string, opts ...clientv3.OpOpt
 }
 
 func (c *EtcdClient) Get(ctx context.Context, key string) (*KeyValue, error) {
-	kvs, err := c.get(ctx, key)
+	kvs, err := c.GetWithOpts(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -129,11 +146,11 @@ func (c *EtcdClient) GetWithSort(ctx context.Context, prefix string, limit int64
 		order = clientv3.SortDescend
 	}
 	opts = append(opts, clientv3.WithSort(clientv3.SortByKey, order))
-	return c.get(ctx, prefix, opts...)
+	return c.GetWithOpts(ctx, prefix, opts...)
 }
 
 func (c *EtcdClient) GetWithPrefix(ctx context.Context, prefix string) (kvs []*KeyValue, err error) {
-	return c.get(ctx, prefix, clientv3.WithPrefix())
+	return c.GetWithOpts(ctx, prefix, clientv3.WithPrefix())
 }
 
 type RangeResult struct {
@@ -165,6 +182,7 @@ func (c *EtcdClient) GetWithRange(ctx context.Context, prefix string, limit int6
 			if !yield(&RangeResult{Kvs: kvs}) {
 				break
 			}
+			// append char '\0' to string
 			key = string(append(resp.Kvs[n-1].Key, 0))
 			if !resp.More {
 				break

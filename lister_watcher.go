@@ -2,35 +2,35 @@ package etcd
 
 import "context"
 
-type TypedKeyObject[T any] struct {
+type KeyObject[T any] struct {
 	Key    string
 	Object T
 }
 
 type EventHandler[T any] interface {
-	OnAdd(newKeyObj *TypedKeyObject[T])
-	OnUpdate(oldKeyObj, newKeyObj *TypedKeyObject[T])
-	OnDelete(oldKeyObj *TypedKeyObject[T])
+	OnAdd(newKeyObj *KeyObject[T])
+	OnUpdate(oldKeyObj, newKeyObj *KeyObject[T])
+	OnDelete(oldKeyObj *KeyObject[T])
 }
 
 type EventHandlerFunc[T any] struct {
-	AddFunc    func(newKeyObj *TypedKeyObject[T])
-	UpdateFunc func(oldKeyObj, newKeyObj *TypedKeyObject[T])
-	DeleteFunc func(oldKeyObj *TypedKeyObject[T])
+	AddFunc    func(newKeyObj *KeyObject[T])
+	UpdateFunc func(oldKeyObj, newKeyObj *KeyObject[T])
+	DeleteFunc func(oldKeyObj *KeyObject[T])
 }
 
-func (h EventHandlerFunc[T]) OnAdd(newKeyObj *TypedKeyObject[T]) {
+func (h EventHandlerFunc[T]) OnAdd(newKeyObj *KeyObject[T]) {
 	if h.AddFunc != nil {
 		h.AddFunc(newKeyObj)
 	}
 }
 
-func (h EventHandlerFunc[T]) OnUpdate(oldKeyObj, newKeyObj *TypedKeyObject[T]) {
+func (h EventHandlerFunc[T]) OnUpdate(oldKeyObj, newKeyObj *KeyObject[T]) {
 	if h.UpdateFunc != nil {
 		h.UpdateFunc(oldKeyObj, newKeyObj)
 	}
 }
-func (h EventHandlerFunc[T]) OnDelete(oldKeyObj *TypedKeyObject[T]) {
+func (h EventHandlerFunc[T]) OnDelete(oldKeyObj *KeyObject[T]) {
 	if h.DeleteFunc != nil {
 		h.DeleteFunc(oldKeyObj)
 	}
